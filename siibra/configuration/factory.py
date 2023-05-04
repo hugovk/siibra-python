@@ -283,8 +283,7 @@ class Factory:
                 modality=spec.get("modality"),
                 publications=spec.get("publications", []),
                 datasets=cls.extract_datasets(spec),
-                is_cached=spec.get("sparsemap").get("cached", False),
-                cache_url=spec.get("sparsemap").get("url", "")
+                is_cached=spec.get("sparsemap").get("cached", False)
             )
 
         Maptype = parcellationmap.Map

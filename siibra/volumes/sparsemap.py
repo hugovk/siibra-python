@@ -234,12 +234,29 @@ class OnTheFlySparseIndex(SparseIndexCacheR):
         
 
 class GitSparseIndexCache(SparseIndexCacheR):
-    def __init__(self, zipfname: str) -> None:
-        super().__init__()
+    
+    def __init__(
+            self,
+            zipfname: str,
+            server: str = 'https://jugit.fz-juelich.de',
+            project: str = 5779,
+            branch: str = "main"
+        ) -> None:
+        super().__init__(self)
         self.zipfname = zipfname
+        self.server = server
+        self.project = project
+        self.branch = branch
+    
+    @property
+    def zip_url(self):
+        gconn = GitlabConnector(self.server, self.project, self.branch)
+        assert self.zipfname in gconn.search_files(), f"{self.zipfname} is not in {gconn}."
+        return gconn.get_loader(self.zipfname).url
 
     def get(self, *, key: str,  **kwargs):
-        zconn = ZipfileConnector(self.zipfname)
+        logger.debug("Loading SparseIndex from Gitlab.")
+        zconn = ZipfileConnector(self.zip_url)
         with ZipFile(zconn.zipfile, 'r') as zp:
             suffices = [".probs.txt.gz", ".bboxes.txt.gz", ".voxels.nii.gz"]
             for suffix in suffices:
@@ -285,10 +302,6 @@ class SparseMap(parcellationmap.Map):
     to the actual (probability) value.
     """
 
-    # A gitlab instance with holds precomputed sparse indices
-    _GITLAB_SERVER = 'https://jugit.fz-juelich.de'
-    _GITLAB_PROJECT = 5779
-
     def __init__(
         self,
         identifier: str,
@@ -302,8 +315,7 @@ class SparseMap(parcellationmap.Map):
         modality: str = None,
         publications: list = [],
         datasets: list = [],
-        is_cached: bool = False,
-        cache_url: str = "",
+        is_cached: bool = False
     ):
         parcellationmap.Map.__init__(
             self,
@@ -320,7 +332,16 @@ class SparseMap(parcellationmap.Map):
             volumes=volumes,
         )
         self._sparse_index_cached = None
-        self._sparseindex_zip_url = cache_url if is_cached else ""
+        
+        self.SPARSEINDEX_LOADERS: List[SparseIndexCacheR] = [
+            LocalSparseIndexCache(),
+            GitSparseIndexCache(f"{self.name.replace(' ', '_')}_index.zip"),
+            # KGDatasetSparseIndexCache("112233")
+        ]
+        self.SPARSEINDEX_WRITERS: List[SparseIndexCacheRW] = [
+            LocalSparseIndexCache()
+        ]
+
     
     @property
     def _cache_prefix(self):
@@ -328,7 +349,6 @@ class SparseMap(parcellationmap.Map):
 
     @property
     def sparse_index(self):
-
         # only compute it once, and store in memory
         if self._sparse_index_cached:
             return self._sparse_index_cached
@@ -338,38 +358,10 @@ class SparseMap(parcellationmap.Map):
                 if sparseidx is not None:
                     self._sparse_index_cached = sparseidx
                     return sparseidx
-            except:
-                pass
+            except Exception:
+                logger.debug(f"Could not load SparseIndex via {loader}", exc_info=1)
         else:
-            raise Exception("cannot load sparse index")
-
-
-        # TODO needs cleanup
-        if self._sparse_index_cached is None:
-            spind = SparseIndex._from_local_cache(self._cache_prefix)
-            if spind is None and len(self._sparseindex_zip_url) > 0:
-                logger.debug("Loading SparseIndex from precomputed source.")
-                try:
-                    spind = self.load_zipped_sparseindex(self._sparseindex_zip_url)
-                except Exception:
-                    logger.debug("Could not load SparseIndex from precomputed source.", exc_info=1)
-            if spind is None:
-                logger.debug("Loading SparseIndex from Gitlab.")
-                gconn = GitlabConnector(self._GITLAB_SERVER, self._GITLAB_PROJECT, "main")
-                zip_fname = f"{self.name.replace(' ', '_')}_index.zip"
-                try:
-                    assert zip_fname in gconn.search_files(), f"{zip_fname} is not in {gconn}."
-                    zipfile = gconn.get_loader(zip_fname).url
-                    spind = self.load_zipped_sparseindex(zipfile)
-                except Exception:
-                    logger.debug(f"Could not load SparseIndex from Gitlab at {gconn}", exc_info=1)
-            if spind is None:
-                # moved to computed_sparse_index
-                spind = self.compute_sparse_index()
-                    
-            self._sparse_index_cached = spind
-        assert self._sparse_index_cached.max() == len(self._sparse_index_cached.probs) - 1
-        return self._sparse_index_cached
+            raise RuntimeError("Cannot load sparse index")
 
     def compute_sparse_index(self) -> SparseIndex:
         """
@@ -386,9 +378,10 @@ class SparseMap(parcellationmap.Map):
                 )
                 if img is None:
                     region = self.get_region(volume=vol)
-                    logger.error(f"Cannot retrieve volume #{vol} for {region.name}, it will not be included in the sparse map.")
-                    continue
+                    raise RuntimeError(f"Cannot retrieve volume #{vol} for {region.name}")
                 spind.add_img(img)
+
+            assert spind.max() == len(spind.probs) - 1
             return spind
 
     @property
@@ -432,16 +425,6 @@ class SparseMap(parcellationmap.Map):
             logger.error("Could not save SparseIndex:\n")
             raise e
         logger.info("SparseIndex is saved.")
-
-    SPARSEINDEX_LOADERS: List[SparseIndexCacheR] = [
-        LocalSparseIndexCache(),
-        GitSparseIndexCache("myfile.zip"),
-        # KGDatasetSparseIndexCache("112233")
-    ]
-
-    SPARSEINDEX_WRITERS: List[SparseIndexCacheRW] = [
-        LocalSparseIndexCache()
-    ]
 
     def load_zipped_sparseindex(self, zipfname: str):
         """
