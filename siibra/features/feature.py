@@ -722,11 +722,21 @@ class CompoundFeature(Feature):
             "Element indices should be unique to each element within a CompoundFeature."
         )
 
+        if hasattr(self._feature_type, "_merge_anchor_locations"):
+            species = {sp for e in elements for sp in e.anchor.species}
+            assert species == elements[0].anchor.species
+            combined_acnhor = _anchor.AnatomicalAnchor(
+                species=species,
+                region=None,
+                location=self._feature_type._merge_anchor_locations(elements)
+            )
+        else:
+            combined_acnhor = sum([f.anchor for f in elements]),
         Feature.__init__(
             self,
             modality=modality,
             description="\n".join({f.description for f in elements}),
-            anchor=sum([f.anchor for f in elements]),
+            anchor=combined_acnhor,
             datasets=list(dict.fromkeys([ds for f in elements for ds in f.datasets]))
         )
         self._queryconcept = queryconcept
