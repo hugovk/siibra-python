@@ -24,7 +24,9 @@ from typing import Union, TYPE_CHECKING, List, Dict, Type, Tuple, BinaryIO, Any,
 from hashlib import md5
 from collections import defaultdict
 from zipfile import ZipFile
-from abc import ABC
+from abc import ABC, abstractmethod
+from re import sub
+from textwrap import wrap
 
 if TYPE_CHECKING:
     from ..retrieval.datasets import EbrainsDataset
@@ -96,7 +98,9 @@ class Feature:
         modality: str,
         description: str,
         anchor: _anchor.AnatomicalAnchor,
-        datasets: List['TypeDataset'] = []
+        datasets: List['TypeDataset'] = [],
+        id: str = None,
+        prerelease: bool = False,
     ):
         """
         Parameters
@@ -113,6 +117,8 @@ class Feature:
         self._description = description
         self._anchor_cached = anchor
         self.datasets = datasets
+        self._id = id
+        self._prerelease = prerelease
 
     @property
     def modality(self):
@@ -166,21 +172,29 @@ class Feature:
 
     @property
     def LICENSE(self) -> str:
-        licenses = {ds.LICENSE for ds in self.datasets if ds.LICENSE}
-        if not licenses:
-            return "No license information is found."
-        if len(licenses) == 1:
-            return next(iter(licenses))
-        logger.info("Found multiple licenses corresponding to datasets.")
+        licenses = []
+        for ds in self.datasets:
+            if ds.LICENSE is None or ds.LICENSE == "No license information is found.":
+                continue
+            if isinstance(ds.LICENSE, str):
+                licenses.append(ds.LICENSE)
+            if isinstance(ds.LICENSE, list):
+                licenses.extend(ds.LICENSE)
+        if len(licenses) == 0:
+            logger.warning("No license information is found.")
+            return ""
+        if len(licenses) > 1:
+            logger.info("Found multiple licenses corresponding to datasets.")
         return '\n'.join(licenses)
 
     @property
-    def doi_or_url(self) -> str:
-        return '\n'.join([
+    def urls(self) -> List[str]:
+        """The list of URLs (including DOIs) associated with this feature."""
+        return [
             url.get("url")
             for ds in self.datasets
             for url in ds.urls
-        ])
+        ]
 
     @property
     def authors(self):
@@ -193,7 +207,9 @@ class Feature:
     @property
     def name(self):
         """Returns a short human-readable name of this feature."""
-        return f"{self.__class__.__name__} ({self.modality}) anchored at {self.anchor}"
+        readable_class_name = sub("([a-z])([A-Z])", r"\g<1> \g<2>", self.__class__.__name__)
+        name_ = sub("([b,B]ig [b,B]rain)", "BigBrain", readable_class_name)
+        return name_ if not self._prerelease else f"[PRERELEASE] {name_}"
 
     @classmethod
     def _get_instances(cls, **kwargs) -> List['Feature']:
@@ -235,13 +251,13 @@ class Feature:
         """ Removes all instantiated object instances"""
         cls._preconfigured_instances = None
 
-    def matches(self, concept: concept.AtlasConcept) -> bool:
+    def matches(self, concept: structure.BrainStructure, restrict_space: bool = False) -> bool:
         """
         Match the features anatomical anchor agains the given query concept.
         Record the most recently matched concept for inspection by the caller.
         """
         # TODO: storing the last matched concept. It is not ideal, might cause problems in multithreading
-        if self.anchor and self.anchor.matches(concept):
+        if self.anchor and self.anchor.matches(concept, restrict_space):
             self.anchor._last_matched_concept = concept
             return True
         self.anchor._last_matched_concept = None
@@ -259,16 +275,26 @@ class Feature:
 
     @property
     def id(self):
+        if self._id:
+            return self._id
+
+        if self._prerelease:
+            name_ = self.name.replace("[PRERELEASE] ", "")
+        else:
+            name_ = self.name
+
         prefix = ''
         for ds in self.datasets:
             if hasattr(ds, "id"):
                 prefix = ds.id + '--'
                 break
-        return prefix + md5(self.name.encode("utf-8")).hexdigest()
+        return prefix + md5(
+            f"{name_} - {self.anchor}".encode("utf-8")
+        ).hexdigest()
 
-    def _export(self, fh: ZipFile):
+    def _to_zip(self, fh: ZipFile):
         """
-        Internal implementation. Subclasses can override but call super()._export(fh).
+        Internal implementation. Subclasses can override but call super()._to_zip(fh).
         This allows all classes in the __mro__ to have the opportunity to append files
         of interest.
         """
@@ -308,7 +334,7 @@ class Feature:
             )
         )
 
-    def export(self, filelike: Union[str, BinaryIO]):
+    def to_zip(self, filelike: Union[str, BinaryIO]):
         """
         Export as a zip archive.
 
@@ -319,7 +345,7 @@ class Feature:
             correct extension (.zip) is set.
         """
         fh = ZipFile(filelike, "w")
-        self._export(fh)
+        self._to_zip(fh)
         fh.close()
 
     @staticmethod
@@ -382,6 +408,7 @@ class Feature:
 
     @staticmethod
     def _encode_concept(concept: concept.AtlasConcept):
+        from ..locations import Location
         encoded_c = []
         if isinstance(concept, space.Space):
             encoded_c.append(f"s:{concept.id}")
@@ -392,6 +419,8 @@ class Feature:
             encoded_c.append(f"r:{concept.name}")
         elif isinstance(concept, volume.Volume):
             encoded_c.append(f"v:{concept.name}")
+        elif isinstance(concept, Location):
+            encoded_c.append(f"loc:{Location}")
 
         if len(encoded_c) == 0:
             raise EncodeLiveQueryIdException("no concept is encoded")
@@ -447,14 +476,17 @@ class Feature:
 
         live_instances = []
         for QueryType in cls._live_queries:
-            argstr = f" ({', '.join('='.join(map(str,_)) for _ in kwargs.items())})" \
+            argstr = f" ({', '.join('='.join(map(str, _)) for _ in kwargs.items())})" \
                 if len(kwargs) > 0 else ""
             logger.debug(
                 f"Running live query for {QueryType.feature_type.__name__} "
                 f"objects linked to {str(concept)}{argstr}"
             )
             q = QueryType(**kwargs)
-            features = q.query(concept)
+            try:
+                features = q.query(concept)
+            except StopIteration:
+                continue
             live_instances.extend(
                 Feature._wrap_livequery_feature(f, Feature._serialize_query_context(f, concept))
                 for f in features
@@ -467,6 +499,7 @@ class Feature:
         cls,
         concept: structure.BrainStructure,
         feature_type: Union[str, Type['Feature'], list],
+        restrict_space: bool = False,
         **kwargs
     ) -> List['Feature']:
         """
@@ -483,8 +516,12 @@ class Feature:
         ----------
         concept: AtlasConcept
             An anatomical concept, typically a brain region or parcellation.
-        modality: subclass of Feature
+        feature_type: subclass of Feature, str
             specififies the type of features ("modality")
+        restrict_space: bool: default: False
+            If true, will skip features anchored at spatial locations of
+            different spaces than the concept. Requires concept to be a
+            Location.
         """
         if isinstance(feature_type, list):
             # a list of feature types is given, collect match results on those
@@ -494,7 +531,7 @@ class Feature:
             )
             return list(dict.fromkeys(
                 sum((
-                    cls._match(concept, t, **kwargs) for t in feature_type
+                    cls._match(concept, t, restrict_space, **kwargs) for t in feature_type
                 ), [])
             ))
 
@@ -511,7 +548,7 @@ class Feature:
                 f"'{feature_type}' decoded as feature type/s: "
                 f"{[c.__name__ for c in ftype_candidates]}."
             )
-            return cls._match(concept, ftype_candidates, **kwargs)
+            return cls._match(concept, ftype_candidates, restrict_space, **kwargs)
 
         assert issubclass(feature_type, Feature)
 
@@ -537,7 +574,7 @@ class Feature:
                 total=len(instances),
                 disable=(not instances)
             )
-            if f.matches(concept)
+            if f.matches(concept, restrict_space)
         ]
 
         # Then run any registered live queries for the requested feature type
@@ -601,6 +638,7 @@ class Feature:
             def __init__(self, inst: Feature, fid: str):
                 self.inst = inst
                 self.fid = fid
+                self.category = inst.category
 
             def __str__(self) -> str:
                 return self.inst.__str__()
@@ -667,6 +705,28 @@ class Compoundable(ABC):
         assert hash(index), "`_element_index` of a compoundable must be hashable."
         return index
 
+    @classmethod
+    def _merge_anchors(cls, anchors: List[_anchor.AnatomicalAnchor]):
+        return sum(anchors)
+
+    @classmethod
+    @abstractmethod
+    def _merge_elements(
+        cls,
+        elements,
+        description: str,
+        modality: str,
+        anchor: _anchor.AnatomicalAnchor
+    ) -> Feature:
+        """
+        Compute the merge data and create a merged instance from a set of
+        elements of this class. This will be used by CompoundFeature to
+        create the aggegated data and plot it. For example, to compute an
+        average connectivity matrix from a set of subfeatures, we create a
+        RegionalConnectivty feature.
+        """
+        raise NotImplementedError
+
 
 class CompoundFeature(Feature):
     """
@@ -679,7 +739,7 @@ class CompoundFeature(Feature):
     def __init__(
         self,
         elements: List['Feature'],
-        queryconcept: Union[region.Region, parcellation.Parcellation, space.Space]
+        queryconcept: Union[region.Region, parcellation.Parcellation, space.Space],
     ):
         """
         A compound of several features of the same type with an anchor created
@@ -711,10 +771,12 @@ class CompoundFeature(Feature):
             self,
             modality=modality,
             description="\n".join({f.description for f in elements}),
-            anchor=sum([f.anchor for f in elements]),
-            datasets=list(dict.fromkeys([ds for f in elements for ds in f.datasets]))
+            anchor=self._feature_type._merge_anchors([f.anchor for f in elements]),
+            datasets=list(dict.fromkeys([ds for f in elements for ds in f.datasets])),
+            prerelease=all(f._prerelease for f in elements),
         )
         self._queryconcept = queryconcept
+        self._merged_feature_cached = None
 
     def __getattr__(self, attr: str) -> Any:
         """Expose compounding attributes explicitly."""
@@ -733,9 +795,27 @@ class CompoundFeature(Feature):
         return super().__dir__() + list(self._compounding_attributes.keys())
 
     def plot(self, *args, **kwargs):
-        raise NotImplementedError(
-            "CompoundFeatures does not have a standardized plot. Try plotting the elements instead."
+        kwargs["title"] = "(Derived data: averaged)\n" + kwargs.get(
+            "title",
+            "\n".join(wrap(self.name, kwargs.pop("textwrap", 40)))
         )
+        return self._get_merged_feature().plot(*args, **kwargs)
+
+    def _get_merged_feature(self) -> Feature:
+        if self._merged_feature_cached is None:
+            logger.info(f"{self.__class__.__name__}.data averages the data of each element.")
+            assert issubclass(self.feature_type, Compoundable)
+            self._merged_feature_cached = self.feature_type._merge_elements(
+                elements=self.elements,
+                modality=self.modality,
+                description=self.description,
+                anchor=self.anchor
+            )
+        return self._merged_feature_cached
+
+    @property
+    def data(self):
+        return self._get_merged_feature().data
 
     @property
     def indexing_attributes(self) -> Tuple[str]:
@@ -760,23 +840,30 @@ class CompoundFeature(Feature):
     @property
     def name(self) -> str:
         """Returns a short human-readable name of this feature."""
-        groupby = ', '.join([
-            f"{v} {k}" for k, v in self._compounding_attributes.items()
-        ])
-        return (
-            f"{self.__class__.__name__} of {len(self)} "
-            f"{self.feature_type.__name__} features grouped by ({groupby})"
-            f" anchored at {self.anchor}"
+        readable_feature_type = sub(
+            "([b,B]ig [b,B]rain)", "BigBrain",
+            sub("([a-z])([A-Z])", r"\g<1> \g<2>", self.feature_type.__name__)
         )
+        groupby = ', '.join([
+            f"{k}: {v}"
+            for k, v in self._compounding_attributes.items()
+            if k != 'modality'
+        ])
+        cf_name = f"{len(self)} {readable_feature_type} features{f' {groupby}' if groupby else ''}"
+        return cf_name if not self._prerelease else f"[PRERELEASE] {cf_name}"
 
     @property
     def id(self) -> str:
+        if self._prerelease:
+            name_ = self.name.replace("[PRERELEASE] ", "")
+        else:
+            name_ = self.name
         return "::".join((
             "cf0",
             f"{self._feature_type.__name__}",
             self._encode_concept(self._queryconcept),
             self.datasets[0].id if self.datasets else "nodsid",
-            md5(self.name.encode("utf-8")).hexdigest()
+            md5(name_.encode("utf-8")).hexdigest()
         ))
 
     def __iter__(self) -> Iterator['Feature']:
@@ -873,8 +960,8 @@ class CompoundFeature(Feature):
         else:
             raise ParseCompoundFeatureIdException
 
-    def _export(self, fh: ZipFile):
-        super()._export(fh)
+    def _to_zip(self, fh: ZipFile):
+        super()._to_zip(fh)
         for idx, element in siibra_tqdm(self._elements.items(), desc="Exporting elements", unit="element"):
             if '/' in str(idx):
                 logger.warning(f"'/' will be replaced with ' ' of the file for element with index {idx}")
